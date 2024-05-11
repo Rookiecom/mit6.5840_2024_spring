@@ -81,12 +81,18 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	identity    int32 // follower, candidate, leader
-	currentTerm int32
-	votedFor    int32
-	logs        []LogEntry
-	nextIndex   []int
-	matchIndex  []int
+	identity       int32 // follower, candidate, leader
+	currentTerm    int32
+	votedFor       int32
+	electionTicker *time.Ticker
+	logs           []LogEntry
+	nextIndex      []int
+	matchIndex     []int
+}
+
+func getElectionTime() time.Duration {
+	ms := electionTimeoutBase + rand.Int()%electionTImeoutDelta
+	return time.Duration(ms) * time.Millisecond
 }
 
 // return currentTerm and whether this server
@@ -186,11 +192,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			dlog.Printf(dlog.DVote, "S%d refused to vote S%d(vote for %d))", rf.me, args.CandidateID, rf.votedFor)
 			return
 		}
-		if len(rf.logs) > 0 {
-			return
-		} else if rf.logs[len(rf.logs)-1].Term > args.LastlogTerm ||
+		if len(rf.logs) > 0 && (rf.logs[len(rf.logs)-1].Term > args.LastlogTerm ||
 			(rf.logs[len(rf.logs)-1].Term == args.LastlogTerm &&
-				len(rf.logs)-1 > args.LastLogIndex) {
+				len(rf.logs)-1 > args.LastLogIndex)) {
 			return
 		}
 
@@ -204,11 +208,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if rf.identity == leaderServer && rf.currentTerm < args.Term {
 		rf.identity = followerServer // for the safty in the heart
+		rf.electionTicker.Reset(getElectionTime())
 		go rf.ticker()
 	}
 
-	rf.identity = followerServer // election ticker or candidate feel bigger term
-
+	rf.identity = followerServer               // candidate feel bigger term
+	rf.electionTicker.Reset(getElectionTime()) // reset election timer
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -272,7 +277,8 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	}
 	dlog.Printf(dlog.DInfo, "S%d receive heartbeat S%d", rf.me, args.LeadId)
 	if rf.currentTerm == args.Term {
-		rf.identity = followerServer // election ticker or candidate feel bigger term
+		rf.identity = followerServer // candidate feel bigger term
+		rf.electionTicker.Reset(getElectionTime())
 		reply.Success = true
 		return
 	}
@@ -282,7 +288,8 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		rf.identity = followerServer
 		go rf.ticker()
 	}
-	rf.identity = followerServer // election ticker or candidate feel bigger term
+	rf.identity = followerServer // candidate feel bigger term
+	rf.electionTicker.Reset(getElectionTime())
 	reply.Success = true
 	rf.votedFor = voteForNothing
 
@@ -419,8 +426,11 @@ func (rf *Raft) startElection() {
 			if reply.Term > rf.currentTerm {
 				dlog.Printf(dlog.DVote, "S%d find S%d's term bigger than itself -> follower", rf.me, server)
 				voteChannel <- false
-				atomic.StoreInt32(&rf.identity, followerServer) // return to the loop of election ticker
-				atomic.StoreInt32(&rf.votedFor, voteForNothing)
+				rf.mu.Lock()
+				rf.currentTerm = reply.Term
+				rf.identity = followerServer // return to the loop of election ticker
+				rf.votedFor = voteForNothing
+				rf.mu.Unlock()
 				return
 			}
 
@@ -431,38 +441,41 @@ func (rf *Raft) startElection() {
 
 	vote := 1
 	count := 1
-	for flag := range voteChannel {
-		if atomic.LoadInt32(&rf.identity) != candidateServer {
-			// find someone which has bigger term through heartbeat or requestvote
-			// or the other election make it a leader
-			return
-		}
-		count++
-		if flag {
-			vote++
-		}
-		if vote > len(rf.peers)/2 {
-			// success to be elected to leader
-			dlog.Printf(dlog.DLeader, "S%d become a leader", rf.me)
-			rf.identity = leaderServer
-			i := 0
-			lastLogIndex := len(rf.logs)
-			for ; i < len(rf.nextIndex); i++ {
-				rf.nextIndex[i] = lastLogIndex
-				rf.matchIndex[i] = 0
+LOOP:
+	for {
+		select {
+		case flag := <-voteChannel:
+			count++
+			if flag {
+				vote++
 			}
-			for ; i < len(rf.logs); i++ {
-				rf.nextIndex = append(rf.nextIndex, lastLogIndex)
-				rf.matchIndex = append(rf.matchIndex, 0)
+			if vote > len(rf.peers)/2 {
+				// success to be elected to leader
+				dlog.Printf(dlog.DLeader, "S%d become a leader", rf.me)
+				rf.identity = leaderServer
+				i := 0
+				lastLogIndex := len(rf.logs)
+				for ; i < len(rf.nextIndex); i++ {
+					rf.nextIndex[i] = lastLogIndex
+					rf.matchIndex[i] = 0
+				}
+				for ; i < len(rf.logs); i++ {
+					rf.nextIndex = append(rf.nextIndex, lastLogIndex)
+					rf.matchIndex = append(rf.matchIndex, 0)
+				}
+
+				go rf.maintainLeader()
+				break LOOP
+			}
+			if count == len(rf.peers) {
+				dlog.Printf(dlog.DVote, "S%d receive %v votes(< %v), failed", rf.me, vote, len(rf.peers)/2+1)
+				break LOOP
+			}
+		default:
+			if atomic.LoadInt32(&rf.identity) != candidateServer {
+				break LOOP
 			}
 
-			go rf.maintainLeader()
-			break
-		}
-		if count == len(rf.peers) {
-			dlog.Printf(dlog.DVote, "S%d receive %v votes(< %v), failed", rf.me, vote, len(rf.peers)/2+1)
-
-			break
 		}
 	}
 
@@ -481,27 +494,20 @@ func (rf *Raft) ticker() {
 	}
 	dlog.Printf(dlog.DLog, "S%d start ticker", rf.me)
 
-	ms := electionTimeoutBase + (rand.Int63() % electionTImeoutDelta)
-
-	ticker := time.NewTicker(time.Duration(ms) * time.Millisecond)
-
 	for !rf.killed() {
 
-		<-ticker.C
-
-		if atomic.LoadInt32(&rf.identity) == candidateServer {
-			rf.mu.Lock()
-			rf.currentTerm++
-			rf.votedFor = int32(rf.me)
-			rf.mu.Unlock()
-			go rf.startElection()
-		}
+		<-rf.electionTicker.C
+		rf.electionTicker.Stop()
 		if atomic.LoadInt32(&rf.identity) == leaderServer {
-			break
+			return
 		}
-		atomic.StoreInt32(&rf.identity, candidateServer)
-		ms := electionTimeoutBase + (rand.Int63() % electionTImeoutDelta)
-		ticker.Reset(time.Duration(ms) * time.Millisecond)
+		rf.mu.Lock()
+		rf.identity = candidateServer
+		rf.currentTerm++
+		rf.mu.Unlock()
+		go rf.startElection()
+
+		rf.electionTicker.Reset(getElectionTime())
 	}
 }
 
@@ -523,6 +529,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (3A, 3B, 3C).
 	rf.identity = followerServer
+	rf.electionTicker = time.NewTicker(getElectionTime())
 	rf.dead = 0
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
