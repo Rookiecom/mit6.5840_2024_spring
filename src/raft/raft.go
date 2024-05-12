@@ -176,6 +176,7 @@ type RequestVoteReply struct {
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	// TODO 需要满足任期和日志两个要求（并列地位）
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -188,16 +189,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	if rf.currentTerm == args.Term {
+		// avoid vote again in the same term
 		if rf.votedFor == int32(rf.me) || rf.votedFor == args.CandidateID || rf.votedFor != voteForNothing {
 			dlog.Printf(dlog.DVote, "S%d refused to vote S%d(vote for %d))", rf.me, args.CandidateID, rf.votedFor)
 			return
 		}
-		if len(rf.logs) > 0 && (rf.logs[len(rf.logs)-1].Term > args.LastlogTerm ||
-			(rf.logs[len(rf.logs)-1].Term == args.LastlogTerm &&
-				len(rf.logs)-1 > args.LastLogIndex)) {
-			return
-		}
+	}
 
+	if len(rf.logs) > 0 && (rf.logs[len(rf.logs)-1].Term > args.LastlogTerm ||
+		(rf.logs[len(rf.logs)-1].Term == args.LastlogTerm &&
+			len(rf.logs)-1 > args.LastLogIndex)) {
+		return
 	}
 	// rf.currentTerm < args.Term || rf.currentTerm == args.Term and can vote
 	dlog.Printf(dlog.DVote, "S%d -> S%d", rf.me, args.CandidateID)
@@ -475,7 +477,7 @@ LOOP:
 			if atomic.LoadInt32(&rf.identity) != candidateServer {
 				break LOOP
 			}
-
+			time.Sleep(5 * time.Millisecond) // avoid excessive use of cpu
 		}
 	}
 
@@ -531,6 +533,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.identity = followerServer
 	rf.electionTicker = time.NewTicker(getElectionTime())
 	rf.dead = 0
+	rf.votedFor = voteForNothing
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
