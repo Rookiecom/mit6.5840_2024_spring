@@ -6,7 +6,7 @@ rate of process:
 - [X] lab2: Key/Value Server
 - [ ] lab3:
   - [X] A: leader election
-  - [ ] B: log
+  - [X] B: log
   - [ ] C: persistence
   - [ ] D: log compaction
 - [ ] lab4: Fault-tolerant Key/Value Service

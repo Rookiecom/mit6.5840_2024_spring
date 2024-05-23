@@ -300,30 +300,32 @@ func (rf *Raft) handleHeartBeat(args *AppendEntryArgs, reply *AppendEntryReply) 
 		reply.Success = false
 		return
 	}
-	// TODO debug:为什么rf.lastApplied not updated
-	dlog.Printf(dlog.DInfo, "S%d receive heartbeat S%d leadercommit %d, self lastApplied %d", rf.me, args.LeadId, args.LeaderCommit, rf.lastApplied)
-	updateCommitIndex := min(int32(args.LeaderCommit), rf.lastApplied)
 
-	if rf.commitIndex < int32(args.LeaderCommit) && rf.commitIndex < updateCommitIndex {
-		dlog.Printf(dlog.DCommit, "S%d need commit something, updatecommit %d -> %d", rf.me, rf.commitIndex, updateCommitIndex)
-		for rf.commitIndex += 1; ; rf.commitIndex++ {
-			if rf.logs[rf.commitIndex].Command == "dummy msg" {
+	if !(len(rf.logs) <= args.PrevLogIndex || (args.PrevLogIndex > 0 && rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm)) {
+		// avoid commit the situation: leader receive task but can not connnet follower, after a while, leader turned to follower;
+		//when the real leader send heartbeat to this one, if not limited and rf.commitIndex < args.LeaderCommit < rf.lastApplied
+		// it will commit rf.commitIndex ~ args.LeaderCommit(it should not)
+		dlog.Printf(dlog.DLog, "S%d refused heartbeat from S%d, index %d", rf.me, args.LeadId, args.PrevLogIndex+1)
+		updateCommitIndex := min(int32(args.LeaderCommit), rf.lastApplied)
+
+		if rf.commitIndex < int32(args.LeaderCommit) && rf.commitIndex < updateCommitIndex {
+			dlog.Printf(dlog.DCommit, "S%d need commit something, updatecommit %d -> %d", rf.me, rf.commitIndex, updateCommitIndex)
+			for rf.commitIndex += 1; ; rf.commitIndex++ {
+				rf.applyCh <- ApplyMsg{
+					CommandValid: true,
+					Command:      rf.logs[rf.commitIndex].Command,
+					CommandIndex: int(rf.commitIndex),
+				}
+				dlog.Printf(dlog.DCommit, "S%d commit %d", rf.me, rf.commitIndex)
 				if rf.commitIndex == updateCommitIndex {
 					break
 				}
-				continue
-			}
-			rf.applyCh <- ApplyMsg{
-				CommandValid: true,
-				Command:      rf.logs[rf.commitIndex].Command,
-				CommandIndex: int(rf.commitIndex),
-			}
-			dlog.Printf(dlog.DCommit, "S%d commit %d", rf.me, rf.commitIndex)
-			if rf.commitIndex == updateCommitIndex {
-				break
 			}
 		}
+
 	}
+	dlog.Printf(dlog.DInfo, "S%d receive heartbeat S%d leadercommit %d, self lastApplied %d", rf.me, args.LeadId, args.LeaderCommit, rf.lastApplied)
+
 	if rf.currentTerm == args.Term {
 		if rf.identity == leaderServer {
 			// just check it
@@ -347,6 +349,7 @@ func (rf *Raft) handleHeartBeat(args *AppendEntryArgs, reply *AppendEntryReply) 
 		reply.Success = true
 		rf.votedFor = voteForNothing
 	}
+
 }
 
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
@@ -386,7 +389,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		rf.votedFor = voteForNothing
 	}
 
-	if len(rf.logs) <= args.PrevLogIndex || (args.PrevLogIndex >= 0 && rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm) {
+	if len(rf.logs) <= args.PrevLogIndex || (args.PrevLogIndex > 0 && rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm) {
 		dlog.Printf(dlog.DLog, "S%d refused appendEndtrys from S%d, index %d", rf.me, args.LeadId, args.PrevLogIndex+1)
 		reply.Success = false
 		return
@@ -410,12 +413,6 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	if rf.commitIndex < int32(args.LeaderCommit) && rf.commitIndex < updateCommitIndex {
 		dlog.Printf(dlog.DCommit, "S%d need commit something, updatecommit %d -> %d", rf.me, rf.commitIndex, updateCommitIndex)
 		for rf.commitIndex += 1; ; rf.commitIndex++ {
-			if rf.logs[rf.commitIndex].Command == "dummy msg" {
-				if rf.commitIndex == updateCommitIndex {
-					break
-				}
-				continue
-			}
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
 				Command:      rf.logs[rf.commitIndex].Command,
@@ -485,7 +482,7 @@ func (rf *Raft) sendDummyLogEntry(startTerm int, dummyIndex int, server int, rep
 	reply := AppendEntryReply{}
 	for rf.nextIndex[server] != dummyIndex+1 {
 		args.PrevLogIndex = rf.nextIndex[server] - 1
-		if args.PrevLogIndex >= 0 {
+		if args.PrevLogIndex >= 1 {
 			args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
 		}
 		args.Entries[0] = rf.logs[rf.nextIndex[server]]
@@ -505,11 +502,11 @@ func (rf *Raft) sendDummyLogEntry(startTerm int, dummyIndex int, server int, rep
 				break
 			}
 		}
+		rf.mu.Lock()
 		if rf.identity != leaderServer || startTerm != int(rf.currentTerm) {
 			rf.mu.Unlock()
 			return
 		}
-		rf.mu.Lock()
 
 		if reply.Term > rf.currentTerm && rf.identity == leaderServer {
 			dlog.Printf(dlog.DLeader, "S%d find S%d's term(%d) bigger", rf.me, server, reply.Term)
@@ -559,7 +556,7 @@ func (rf *Raft) sendRealLogEntry(startTerm int, server int, task chan int) {
 		args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
 		args.Entries[0] = rf.logs[index]
 
-		for atomic.LoadInt32(&rf.identity) == leaderServer {
+		for {
 			rf.mu.Lock()
 			if rf.identity != leaderServer || startTerm != int(rf.currentTerm) {
 				rf.mu.Unlock()
@@ -602,9 +599,33 @@ func (rf *Raft) sendRealLogEntry(startTerm int, server int, task chan int) {
 
 // TODO important debug 为什么dummyIndex 奇怪
 
-func (rf *Raft) copyLogs(dummyIndex int) {
+func (rf *Raft) copyLogs(startApplied int) {
 	// 首先是发送空日志，这个空日志在大多数服务器上完成之后，提交之前没有提交的信息然后在轮询是否有新日志需要发送
-	dlog.Printf(dlog.DLeader, "S%d start to copy %d dummy log", rf.me, dummyIndex)
+
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		rf.nextIndex[i] = startApplied
+		rf.matchIndex[i] = 1
+	}
+
+	for {
+		rf.mu.Lock()
+		if rf.identity != leaderServer {
+			rf.mu.Unlock()
+			return
+		}
+		if rf.lastApplied >= int32(startApplied) {
+			dlog.Printf(dlog.DLog, "S%d receive %d first log ", rf.me, startApplied)
+			rf.mu.Unlock()
+			break
+		}
+		rf.mu.Unlock()
+		time.Sleep(pollPause * time.Millisecond)
+	}
+
+	dlog.Printf(dlog.DLeader, "S%d start to copy %d first log", rf.me, startApplied)
 
 	report := make(chan struct{}, len(rf.peers))
 	defer func() {
@@ -613,19 +634,19 @@ func (rf *Raft) copyLogs(dummyIndex int) {
 		close(report)
 	}()
 	rf.mu.Lock()
-	dummyTerm := rf.logs[dummyIndex].Term
+	fistTerm := rf.logs[startApplied].Term
 	rf.mu.Unlock()
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
-		go rf.sendDummyLogEntry(dummyTerm, int(dummyIndex), i, report)
+		go rf.sendDummyLogEntry(fistTerm, int(startApplied), i, report)
 	}
-	dummySend := 0
-	for dummySend < len(rf.peers)/2 {
+	fisrtSend := 0
+	for fisrtSend < len(rf.peers)/2 {
 		select {
 		case <-report:
-			dummySend++
+			fisrtSend++
 		default:
 			rf.mu.Lock()
 			if rf.identity != leaderServer {
@@ -636,18 +657,15 @@ func (rf *Raft) copyLogs(dummyIndex int) {
 			time.Sleep(pollPause * time.Millisecond)
 		}
 	}
-	dlog.Printf(dlog.DCommit, "S%d dummy log commit", rf.me)
-	for rf.commitIndex += 1; rf.commitIndex < int32(dummyIndex); rf.commitIndex++ {
-		if rf.logs[rf.commitIndex].Command == "dummy msg" {
-			continue
-		}
+	for rf.commitIndex += 1; rf.commitIndex <= int32(startApplied); rf.commitIndex++ {
 		rf.applyCh <- ApplyMsg{
 			CommandValid: true,
-			Command:      rf.logs[rf.commitIndex],
+			Command:      rf.logs[rf.commitIndex].Command,
 			CommandIndex: int(rf.commitIndex),
 		}
 		dlog.Printf(dlog.DCommit, "S%d commit %d task", rf.me, rf.commitIndex)
 	}
+	rf.commitIndex--
 	taskBroadcast := make([]chan int, len(rf.peers))
 	defer func() {
 		for i := range rf.peers {
@@ -665,18 +683,19 @@ func (rf *Raft) copyLogs(dummyIndex int) {
 		go func(server int, task chan int) {
 			for {
 				rf.mu.Lock()
-				if rf.matchIndex[server] == int(dummyIndex) {
+				if rf.matchIndex[server] == int(startApplied) {
 					rf.mu.Unlock()
 					break
 				}
 				rf.mu.Unlock()
 				time.Sleep(pollPause * time.Millisecond)
 			}
-			rf.sendRealLogEntry(rf.logs[dummyIndex].Term, server, taskBroadcast[server])
+			rf.sendRealLogEntry(fistTerm, server, taskBroadcast[server])
 		}(i, taskBroadcast[i])
 	}
-	lastDistribute := int32(dummyIndex)
+	lastDistribute := int32(startApplied)
 	for {
+		// dlog.Printf(dlog.DInfo, "S%d start new loop", rf.me)
 		rf.mu.Lock()
 		if rf.identity != leaderServer {
 			rf.mu.Unlock()
@@ -790,6 +809,8 @@ func (rf *Raft) maintainLeader() {
 					rf.mu.Unlock()
 					return
 				}
+				appendArgs.PrevLogIndex = int(rf.lastApplied)
+				appendArgs.PrevLogTerm = rf.logs[rf.lastApplied].Term
 				appendArgs.LeaderCommit = int(rf.commitIndex)
 				go rf.sendHeartbeat(server, rf.currentTerm, appendArgs)
 				rf.mu.Unlock()
@@ -802,25 +823,9 @@ func (rf *Raft) maintainLeader() {
 func (rf *Raft) startLead() {
 	dlog.Printf(dlog.DLeader, "S%d become a leader", rf.me)
 	rf.mu.Lock()
-	dummyLog := LogEntry{
-		Term:    int(rf.currentTerm),
-		Command: "dummy msg",
-	}
-	dummyIndex := rf.lastApplied + 1
-	if len(rf.logs) == int(dummyIndex) {
-		rf.logs = append(rf.logs, dummyLog)
-	} else {
-		rf.logs[dummyIndex] = dummyLog
-	}
-	rf.lastApplied++
-	for i := 0; i < len(rf.peers); i++ {
-		rf.nextIndex[i] = int(dummyIndex)
-		rf.matchIndex[i] = 0
-	}
-
+	go rf.copyLogs(int(rf.lastApplied) + 1)
 	rf.identity = leaderServer
 	rf.mu.Unlock()
-	go rf.copyLogs(int(dummyIndex))
 	go rf.maintainLeader()
 }
 
@@ -964,8 +969,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (3A, 3B, 3C).
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
-	rf.commitIndex = -1
-	rf.lastApplied = -1
+	rf.commitIndex = 0 // just for test
+	rf.lastApplied = 0 // just for test, first log must in 1 index
+	rf.logs = append(rf.logs, LogEntry{
+		Term:    -1,
+		Command: "你好",
+	})
 	rf.leaderId = -1
 	rf.applyCh = applyCh
 	rf.identity = followerServer
