@@ -48,5 +48,5 @@ func Printf(topic logTopic, format string, v ...any) {
 		return
 	}
 	time := time.Since(debugStart).Microseconds() / 100
-	log.Printf(fmt.Sprintf("%06d %v ", time, topic)+format, v...)
+	log.Printf(fmt.Sprintf("%07d %v ", time, topic)+format, v...)
 }

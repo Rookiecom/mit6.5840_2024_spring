@@ -2,3 +2,7 @@ pkg/
 api.key
 .api.key.trimmed
 *-handin.tar.gz
+*.spec
+./src/debug/build*
+./src/debug/dist
+.vscode*

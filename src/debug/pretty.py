@@ -68,7 +68,7 @@ def main(
         try:
             time, topic, *msg = line.strip().split(" ")
 
-            if not (time.isdigit() and len(time) == 6):
+            if not (time.isdigit() and len(time) in [6, 7]):
                 raise ValueError("Invalid time format")
 
             # To ignore some topics
